@@ -11,6 +11,8 @@ pub struct Config {
     pub port: u16,
     pub max_size: u64,
     pub max_size_mb: u64,
+    pub encryption_key: [u8; 32],
+    pub allowed_formats: Vec<String>,
 }
 
 impl Config {
@@ -19,6 +21,27 @@ impl Config {
             .unwrap_or_else(|_| "99".into())
             .parse::<u64>()
             .unwrap_or(99);
+
+        // Load encryption key from env, MUST be exactly 64 hex characters (32 bytes)
+        let hex_key = env::var("ENCRYPTION_KEY").expect("ENCRYPTION_KEY must be set in .env");
+        let key_bytes = hex::decode(&hex_key).expect("ENCRYPTION_KEY must be valid hex");
+        assert!(
+            key_bytes.len() == 32,
+            "ENCRYPTION_KEY must be exactly 32 bytes (64 hex characters)"
+        );
+        let mut encryption_key = [0u8; 32];
+        encryption_key.copy_from_slice(&key_bytes);
+
+        // Load allowed formats, default to common image types if missing
+        let formats_str = env::var("ALLOWED_FORMATS").unwrap_or_else(|_| {
+            "image/jpeg,image/png,image/webp,image/gif".into()
+        });
+        
+        let allowed_formats = formats_str
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         Self {
             r2_endpoint: env::var("R2_ENDPOINT").expect("R2_ENDPOINT required"),
@@ -34,6 +57,8 @@ impl Config {
                 .unwrap_or(3000),
             max_size: max_size_mb * 1024 * 1024,
             max_size_mb,
+            encryption_key,
+            allowed_formats,
         }
     }
 }

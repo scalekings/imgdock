@@ -213,9 +213,9 @@ async function confirmUpload(id) {
 
 ---
 
-### 4️⃣ `GET /i/{id}` — Image URL Lo
+### 4️⃣ `GET /i/{id}` — Image Data Lo
 
-Image ka public URL retrieve karta hai. Pehle Redis cache check karta hai, nahi mila toh MongoDB se laata hai.
+Image ka public URL aur metadata retrieve karta hai. Casual scraping se bachane ke liye yeh response **AES-256-GCM** se encrypt ho ke aata hai. 
 
 #### Request
 
@@ -225,57 +225,92 @@ GET /i/{id}
 
 #### Success Response — `200 OK`
 
-**Cache se (Redis):**
 ```json
 {
   "ok": 1,
-  "url": "https://pub-xxxx.r2.dev/20260224/photo.jpg",
-  "c": 1
+  "payload": "f47ac10b5c...<hex_encoded_encrypted_data>"
 }
 ```
 
-**Database se (MongoDB):**
+* Decrypted JSON data ka format yeh hoga:
 ```json
 {
-  "ok": 1,
-  "url": "https://pub-xxxx.r2.dev/20260224/photo.jpg"
+  "url": "https://pub-xxxx.r2.dev/20260224/photo.jpg",
+  "f": "20260224/photo.jpg",
+  "s": 0.12,
+  "t": 1771905247,
+  "d": "",
+  "P": "",
+  "c": 1
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `ok` | number | `1` = success |
-| `url` | string | Image ka public URL |
-| `c` | number (optional) | `1` = cache se aaya. Absent = MongoDB se aaya |
+| `payload` | string | Encrypted data (Hex format). Isme IV + tags dono mix hain. |
 
 #### Error Responses
 
 | Code | Condition | Response |
 |------|-----------|----------|
 | `404` | Image ID nahi mila | `{"ok": 0, "e": "Not Found: Image not found"}` |
-| `500` | MongoDB/Redis error | `{"ok": 0, "e": "Internal Error: ..."}` |
+| `500` | Backend/Encryption error | `{"ok": 0, "e": "Internal Error: ..."}` |
 
-#### JavaScript Example
+---
+
+### 🔓 Frontend JS Decryption Example
+
+Is encrypted `payload` ko frontend pe Web Crypto API ke zariye easily decrypt kiya ja sakta hai bina kisi external library ke. Aapko sirf `.env` wali same 64-character (32-byte) hex key chahiye:
 
 ```javascript
+// Yahan wahi 64-char wali ENCRYPTION_KEY likho
+const API_KEY = "c3b8f646b9df237eeae7902d3f7f897dfdfc7e3aa01e2373e334df578da3c0b1";
+
+async function decryptAPIResponse(hexPayload, hexKey) {
+  // 1. Hex string ko bytes mein convert karo
+  const hexToBytes = hex => new Uint8Array(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+  const keyBytes = hexToBytes(hexKey);
+  const payloadBytes = hexToBytes(hexPayload);
+
+  // 2. Pehle 12 bytes IV (Nonce) hote hain
+  const iv = payloadBytes.slice(0, 12);
+  const ciphertext = payloadBytes.slice(12);
+
+  // 3. Web Crypto API mein key import karo
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']
+  );
+
+  // 4. Data Decrypt karo
+  const decryptedBuffer = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv }, cryptoKey, ciphertext
+  );
+
+  // 5. Bytes ko wapas JSON mein parse karo
+  const decText = new TextDecoder().decode(decryptedBuffer);
+  return JSON.parse(decText);
+}
+
+// 👉 API Call aur Response dikhane ka example:
 async function getImageUrl(id) {
   const response = await fetch(`http://localhost:3000/i/${id}`);
   const data = await response.json();
 
-  if (data.ok === 1) {
-    console.log('Image URL:', data.url);
-    console.log('From cache:', data.c === 1 ? 'Yes' : 'No');
-    return data.url;
+  if (data.ok === 1 && data.payload) {
+    try {
+      const details = await decryptAPIResponse(data.payload, API_KEY);
+      console.log('Decrypted URL:', details.url);
+      
+      // HTML mein image dikhao
+      document.getElementById('preview').src = details.url;
+      return details.url;
+    } catch(e) {
+      console.error('Decryption failed! Wrong key or bad data.');
+    }
   } else {
     console.error('❌ Error:', data.e);
   }
-}
-
-// HTML mein image dikhao
-function showImage(id) {
-  getImageUrl(id).then(url => {
-    document.getElementById('preview').src = url;
-  });
 }
 ```
 
@@ -446,11 +481,9 @@ async function apiCall(url, options = {}) {
 | `image/gif` | `.gif` |
 | `image/webp` | `.webp` |
 | `image/svg+xml` | `.svg` |
-| `image/bmp` | `.bmp` |
-| `image/tiff` | `.tiff` |
-| `image/avif` | `.avif` |
 
-> Server sirf check karta hai ki `type` field `image/` se start hota hai ya nahi. Actual file content validation nahi hoti.
+> ⚠️ **Note:** Yeh server ke `.env` mein define hote hain (`ALLOWED_FORMATS` aur `MAX_SIZE_MB`). Server par match na hone se upload turant reject (`400 Bad Request`) ho jayega. Backend default allowed list: `image/jpeg,image/png,image/webp,image/gif` agar specify na ki gayi ho.
+> Tum agar allow all chahte ho to `.env` mein `ALLOWED_FORMATS=*` daal sakte ho.
 
 ---
 

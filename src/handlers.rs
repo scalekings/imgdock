@@ -1,13 +1,17 @@
 use actix_web::{web, HttpResponse};
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::Client as S3Client;
 use fred::prelude::*;
 use mongodb::Collection;
+use rand::rngs::OsRng;
 use rand::Rng;
+use serde_json::json;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::models::*;
+use crate::models::{AppError, ImageResponsePayload, ObfuscatedResponse, PendingTransfer, TransferRequest, TransferResponse};
 
 pub struct AppState {
     pub config: Config,
@@ -24,10 +28,10 @@ fn now_parts() -> (String, i64) {
         .as_secs();
 
     let days = secs / 86400;
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -35,6 +39,7 @@ fn now_parts() -> (String, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
 
+    #[allow(clippy::cast_possible_wrap)]
     (format!("{y}{m:02}{d:02}"), secs as i64)
 }
 
@@ -46,6 +51,23 @@ fn gen_id() -> String {
         .collect()
 }
 
+/// Encrypts JSON payload using AES-256-GCM. Returns hex-encoded "iv + ciphertext + `auth_tag`"
+fn encrypt_payload(json: &str, key: &[u8; 32]) -> Result<String, AppError> {
+    let cipher = Aes256Gcm::new(key.into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut OsRng, &mut nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), json.as_bytes())
+        .map_err(|_| AppError::Internal("Encryption failure".into()))?;
+
+    // Prepend 12-byte IV/nonce to ciphertext
+    let mut final_payload = nonce_bytes.to_vec();
+    final_payload.extend_from_slice(&ciphertext);
+
+    Ok(hex::encode(final_payload))
+}
+
 // POST /transfer
 pub async fn create_transfer(
     state: web::Data<AppState>,
@@ -54,8 +76,15 @@ pub async fn create_transfer(
     if body.name.is_empty() {
         return Err(AppError::BadRequest("Name cannot be empty".into()));
     }
-    if !body.content_type.starts_with("image/") {
-        return Err(AppError::BadRequest("File must be an image".into()));
+
+    let content_type = body.content_type.to_lowercase();
+    if !state.config.allowed_formats.contains(&content_type)
+        && !state.config.allowed_formats.contains(&"*".to_string())
+    {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported file format. Allowed: {}",
+            state.config.allowed_formats.join(", ")
+        )));
     }
     if body.size > state.config.max_size {
         return Err(AppError::LargePayload(format!(
@@ -147,7 +176,11 @@ pub async fn complete_transfer(
 
     let (_, ts) = now_parts();
     let f = pending.key;
-    let s = ((pending.size as f64 / (1024.0 * 1024.0)) * 100.0).round() / 100.0;
+
+    // Convert to MB and round to 2 decimals using safe f64 conversion scaling
+    #[allow(clippy::cast_precision_loss)]
+    let s_mb = pending.size as f64 / 1_048_576.0;
+    let s = (s_mb * 100.0).round() / 100.0;
 
     let url = format!(
         "{}/{}",
@@ -170,22 +203,20 @@ pub async fn complete_transfer(
 
     log::info!("Saved: {id}");
 
-    // Cache full ImageResponse JSON so get_image cache hits return all fields
-    let response = ImageResponse {
-        ok: 1,
-        id: id.clone(),
+    // Cache internal payload JSON (without cache indicator yet)
+    let internal_payload = ImageResponsePayload {
         url,
         f,
         s,
         t: ts,
-        d: None,
-        p: None,
+        d: String::new(),
+        p: String::new(),
         c: None,
     };
 
     let _: Result<(), _> = state.redis.del(&redis_key).await;
 
-    if let Ok(json) = serde_json::to_string(&response) {
+    if let Ok(json) = serde_json::to_string(&internal_payload) {
         let _: Result<(), _> = state
             .redis
             .set(
@@ -198,10 +229,11 @@ pub async fn complete_transfer(
             .await;
     }
 
-    Ok(HttpResponse::Ok().json(CompleteResponse { ok: 1, id }))
+    Ok(HttpResponse::Ok().json(json!({ "ok": 1, "id": id })))
 }
 
 // GET /i/{id}
+#[allow(clippy::many_single_char_names)]
 pub async fn get_image(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -209,16 +241,22 @@ pub async fn get_image(
     let id = path.into_inner();
     let cache_key = format!("i:{id}");
 
-    // Check Redis cache (stores full JSON response)
+    // Check Redis cache (stores internal payload JSON)
     if let Some(cached_json) = state
         .redis
         .get::<Option<String>, _>(&cache_key)
         .await
         .unwrap_or(None)
     {
-        if let Ok(mut cached) = serde_json::from_str::<ImageResponse>(&cached_json) {
-            cached.c = Some(1);
-            return Ok(HttpResponse::Ok().json(cached));
+        if let Ok(mut payload_obj) = serde_json::from_str::<ImageResponsePayload>(&cached_json) {
+            payload_obj.c = Some(1); // Set cache flag to true
+            let final_json = serde_json::to_string(&payload_obj).unwrap();
+            let encrypted_hex = encrypt_payload(&final_json, &state.config.encryption_key)?;
+
+            return Ok(HttpResponse::Ok().json(ObfuscatedResponse {
+                ok: 1,
+                payload: encrypted_hex,
+            }));
         }
     }
 
@@ -232,8 +270,8 @@ pub async fn get_image(
     let f = doc.get_str("f").unwrap_or("").to_string();
     let s = doc.get_f64("s").unwrap_or(0.0);
     let t = doc.get_i64("t").unwrap_or(0);
-    let d_val = doc.get_str("d").unwrap_or("").to_string();
-    let p_val = doc.get_str("P").unwrap_or("").to_string();
+    let d = doc.get_str("d").unwrap_or("").to_string();
+    let p = doc.get_str("P").unwrap_or("").to_string();
 
     let url = format!(
         "{}/{}",
@@ -241,12 +279,7 @@ pub async fn get_image(
         urlencoding::encode(&f)
     );
 
-    let d = if d_val.is_empty() { None } else { Some(d_val) };
-    let p = if p_val.is_empty() { None } else { Some(p_val) };
-
-    let response = ImageResponse {
-        ok: 1,
-        id: id.clone(),
+    let payload_obj = ImageResponsePayload {
         url,
         f,
         s,
@@ -256,8 +289,8 @@ pub async fn get_image(
         c: None,
     };
 
-    // Cache full response JSON (24h)
-    if let Ok(json) = serde_json::to_string(&response) {
+    // Cache internal payload JSON (24h)
+    if let Ok(json) = serde_json::to_string(&payload_obj) {
         let _: Result<(), _> = state
             .redis
             .set(
@@ -270,10 +303,16 @@ pub async fn get_image(
             .await;
     }
 
-    Ok(HttpResponse::Ok().json(response))
+    let final_json = serde_json::to_string(&payload_obj).unwrap();
+    let encrypted_hex = encrypt_payload(&final_json, &state.config.encryption_key)?;
+
+    Ok(HttpResponse::Ok().json(ObfuscatedResponse {
+        ok: 1,
+        payload: encrypted_hex,
+    }))
 }
 
 // GET /health
 pub async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(HealthResponse { ok: 1 })
+    HttpResponse::Ok().json(json!({ "ok": 1 }))
 }

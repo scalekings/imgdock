@@ -25,31 +25,25 @@ pub struct TransferResponse {
     pub key: String,
 }
 
-#[derive(Serialize)]
-pub struct CompleteResponse {
-    pub ok: u8,
-    pub id: String,
-}
-
+// Internal representation for AES-GCM encryption
 #[derive(Serialize, Deserialize, Clone)]
-pub struct ImageResponse {
-    pub ok: u8,
-    pub id: String,
+pub struct ImageResponsePayload {
     pub url: String,
     pub f: String,
     pub s: f64,
     pub t: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub d: Option<String>,
-    #[serde(rename = "P", skip_serializing_if = "Option::is_none")]
-    pub p: Option<String>,
+    pub d: String,
+    #[serde(rename = "P")]
+    pub p: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub c: Option<u8>,
 }
 
+// What the client actually receives
 #[derive(Serialize)]
-pub struct HealthResponse {
+pub struct ObfuscatedResponse {
     pub ok: u8,
+    pub payload: String,
 }
 
 #[derive(Debug)]
@@ -71,12 +65,6 @@ impl fmt::Display for AppError {
     }
 }
 
-#[derive(Serialize)]
-struct ErrorBody {
-    ok: u8,
-    e: String,
-}
-
 impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
@@ -88,9 +76,9 @@ impl ResponseError for AppError {
     }
 
     fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code()).json(ErrorBody {
-            ok: 0,
-            e: self.to_string(),
-        })
+        HttpResponse::build(self.status_code()).json(serde_json::json!({
+            "ok": 0,
+            "e": self.to_string(),
+        }))
     }
 }
