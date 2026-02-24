@@ -1,6 +1,5 @@
 use std::env;
 
-#[derive(Clone)]
 pub struct Config {
     pub r2_endpoint: String,
     pub r2_bucket: String,
@@ -11,10 +10,16 @@ pub struct Config {
     pub redis_url: String,
     pub port: u16,
     pub max_size: u64,
+    pub max_size_mb: u64,
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        let max_size_mb = env::var("MAX_SIZE_MB")
+            .unwrap_or_else(|_| "99".into())
+            .parse::<u64>()
+            .unwrap_or(99);
+
         Self {
             r2_endpoint: env::var("R2_ENDPOINT").expect("R2_ENDPOINT required"),
             r2_bucket: env::var("R2_BUCKET").expect("R2_BUCKET required"),
@@ -24,15 +29,11 @@ impl Config {
             mongo_uri: env::var("MONGO_URI").expect("MONGO_URI required"),
             redis_url: env::var("REDIS_URL").expect("REDIS_URL required"),
             port: env::var("PORT")
-                .unwrap_or_else(|_| "3000".to_string())
+                .unwrap_or_else(|_| "3000".into())
                 .parse()
                 .unwrap_or(3000),
-            max_size: env::var("MAX_SIZE_MB")
-                .unwrap_or_else(|_| "99".to_string())
-                .parse::<u64>()
-                .unwrap_or(99)
-                * 1024
-                * 1024,
+            max_size: max_size_mb * 1024 * 1024,
+            max_size_mb,
         }
     }
 }

@@ -2,8 +2,6 @@ use actix_web::{http::StatusCode, HttpResponse, ResponseError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// ============ Request Models ============
-
 #[derive(Deserialize)]
 pub struct TransferRequest {
     pub name: String,
@@ -12,18 +10,11 @@ pub struct TransferRequest {
     pub content_type: String,
 }
 
-// ============ Redis Pending Data ============
-
 #[derive(Serialize, Deserialize)]
 pub struct PendingTransfer {
     pub key: String,
-    pub name: String,
     pub size: u64,
-    #[serde(rename = "type")]
-    pub content_type: String,
 }
-
-// ============ Response Models ============
 
 #[derive(Serialize)]
 pub struct TransferResponse {
@@ -40,10 +31,18 @@ pub struct CompleteResponse {
     pub id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ImageResponse {
     pub ok: u8,
+    pub id: String,
     pub url: String,
+    pub f: String,
+    pub s: f64,
+    pub t: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub d: Option<String>,
+    #[serde(rename = "P", skip_serializing_if = "Option::is_none")]
+    pub p: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub c: Option<u8>,
 }
@@ -52,8 +51,6 @@ pub struct ImageResponse {
 pub struct HealthResponse {
     pub ok: u8,
 }
-
-// ============ Error Handling ============
 
 #[derive(Debug)]
 pub enum AppError {
@@ -66,10 +63,10 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AppError::BadRequest(e) => write!(f, "Bad Request: {}", e),
-            AppError::NotFound(e) => write!(f, "Not Found: {}", e),
-            AppError::Internal(e) => write!(f, "Internal Error: {}", e),
-            AppError::LargePayload(e) => write!(f, "Payload Too Large: {}", e),
+            Self::BadRequest(e) => write!(f, "Bad Request: {e}"),
+            Self::NotFound(e) => write!(f, "Not Found: {e}"),
+            Self::Internal(e) => write!(f, "Internal Error: {e}"),
+            Self::LargePayload(e) => write!(f, "Payload Too Large: {e}"),
         }
     }
 }
@@ -83,10 +80,10 @@ struct ErrorBody {
 impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
-            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            AppError::NotFound(_) => StatusCode::NOT_FOUND,
-            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AppError::LargePayload(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::LargePayload(_) => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 

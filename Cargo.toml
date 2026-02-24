@@ -14,7 +14,6 @@ aws-credential-types = "1.2"
 mongodb = "3"
 fred = { version = "9", features = ["enable-native-tls"] }
 dotenvy = "0.15"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 rand = "0.8"
 urlencoding = "2.1"
 env_logger = "0.11"

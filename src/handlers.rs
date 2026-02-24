@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse};
-use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::presigning::PresigningConfig;
+use aws_sdk_s3::Client as S3Client;
 use fred::prelude::*;
 use mongodb::Collection;
 use rand::Rng;
@@ -16,27 +16,14 @@ pub struct AppState {
     pub redis: RedisClient,
 }
 
-fn gen_id() -> String {
-    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..6)
-        .map(|_| CHARS[rng.gen_range(0..62)] as char)
-        .collect()
-}
-
-fn date_folder() -> String {
-    let now = std::time::SystemTime::now()
+/// Returns (YYYYMMDD date folder, unix timestamp seconds)
+fn now_parts() -> (String, i64) {
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let days = now / 86400;
-    // Convert days since epoch to YYYYMMDD
-    let (y, m, d) = days_to_ymd(days);
-    format!("{}{:02}{:02}", y, m, d)
-}
 
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let days = secs / 86400;
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -47,14 +34,16 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+
+    (format!("{y}{m:02}{d:02}"), secs as i64)
 }
 
-fn unix_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+fn gen_id() -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 // POST /transfer
@@ -71,14 +60,15 @@ pub async fn create_transfer(
     if body.size > state.config.max_size {
         return Err(AppError::LargePayload(format!(
             "Max {}MB",
-            state.config.max_size / 1024 / 1024
+            state.config.max_size_mb
         )));
     }
 
     let id = gen_id();
-    let key = format!("{}/{}", date_folder(), body.name);
+    let (date, _) = now_parts();
+    let key = format!("{date}/{}", body.name);
 
-    log::info!("Transfer: {} → {}", id, key);
+    log::info!("Transfer: {id} → {key}");
 
     let presign_config = PresigningConfig::builder()
         .expires_in(Duration::from_secs(300))
@@ -99,9 +89,7 @@ pub async fn create_transfer(
 
     let pending = PendingTransfer {
         key: key.clone(),
-        name: body.name.clone(),
         size: body.size,
-        content_type: body.content_type.clone(),
     };
 
     let pending_json =
@@ -110,14 +98,14 @@ pub async fn create_transfer(
     state
         .redis
         .set::<(), _, _>(
-            format!("pending:{}", id),
+            format!("pending:{id}"),
             &pending_json,
             Some(Expiration::EX(300)),
             None,
             false,
         )
         .await
-        .map_err(|e| AppError::Internal(format!("Redis: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Redis: {e}")))?;
 
     Ok(HttpResponse::Ok().json(TransferResponse {
         ok: 1,
@@ -133,13 +121,13 @@ pub async fn complete_transfer(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let redis_key = format!("pending:{}", id);
+    let redis_key = format!("pending:{id}");
 
     let pending_json: Option<String> = state
         .redis
         .get(&redis_key)
         .await
-        .map_err(|e| AppError::Internal(format!("Redis: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Redis: {e}")))?;
 
     let pending: PendingTransfer = serde_json::from_str(
         &pending_json.ok_or_else(|| AppError::NotFound("Transfer expired or not found".into()))?,
@@ -155,40 +143,60 @@ pub async fn complete_transfer(
         .await
         .map_err(|_| AppError::BadRequest("File not uploaded to storage".into()))?;
 
-    log::info!("Verified: {}", id);
+    log::info!("Verified: {id}");
+
+    let (_, ts) = now_parts();
+    let f = pending.key;
+    let s = ((pending.size as f64 / (1024.0 * 1024.0)) * 100.0).round() / 100.0;
 
     let url = format!(
         "{}/{}",
         state.config.r2_public_domain,
-        urlencoding::encode(&pending.key)
+        urlencoding::encode(&f)
     );
 
     state
         .db
         .insert_one(mongodb::bson::doc! {
             "_id": &id,
-            "f": &pending.key,
-            "s": ((pending.size as f64 / (1024.0 * 1024.0)) * 100.0).round() / 100.0,
-            "t": unix_timestamp(),
+            "f": &f,
+            "s": s,
+            "t": ts,
             "d": "",
             "P": "",
         })
         .await
-        .map_err(|e| AppError::Internal(format!("MongoDB: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("MongoDB: {e}")))?;
 
-    log::info!("Saved: {}", id);
+    log::info!("Saved: {id}");
+
+    // Cache full ImageResponse JSON so get_image cache hits return all fields
+    let response = ImageResponse {
+        ok: 1,
+        id: id.clone(),
+        url,
+        f,
+        s,
+        t: ts,
+        d: None,
+        p: None,
+        c: None,
+    };
 
     let _: Result<(), _> = state.redis.del(&redis_key).await;
-    let _: Result<(), _> = state
-        .redis
-        .set(
-            format!("i:{}", id),
-            &url,
-            Some(Expiration::EX(86400)),
-            None,
-            false,
-        )
-        .await;
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _: Result<(), _> = state
+            .redis
+            .set(
+                format!("i:{id}"),
+                &json,
+                Some(Expiration::EX(86400)),
+                None,
+                false,
+            )
+            .await;
+    }
 
     Ok(HttpResponse::Ok().json(CompleteResponse { ok: 1, id }))
 }
@@ -199,50 +207,70 @@ pub async fn get_image(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let cache_key = format!("i:{}", id);
+    let cache_key = format!("i:{id}");
 
-    if let Some(url) = state
+    // Check Redis cache (stores full JSON response)
+    if let Some(cached_json) = state
         .redis
         .get::<Option<String>, _>(&cache_key)
         .await
         .unwrap_or(None)
     {
-        return Ok(HttpResponse::Ok().json(ImageResponse {
-            ok: 1,
-            url,
-            c: Some(1),
-        }));
+        if let Ok(mut cached) = serde_json::from_str::<ImageResponse>(&cached_json) {
+            cached.c = Some(1);
+            return Ok(HttpResponse::Ok().json(cached));
+        }
     }
 
     let doc = state
         .db
         .find_one(mongodb::bson::doc! { "_id": &id })
         .await
-        .map_err(|e| AppError::Internal(format!("MongoDB: {}", e)))?
+        .map_err(|e| AppError::Internal(format!("MongoDB: {e}")))?
         .ok_or_else(|| AppError::NotFound("Image not found".into()))?;
+
+    let f = doc.get_str("f").unwrap_or("").to_string();
+    let s = doc.get_f64("s").unwrap_or(0.0);
+    let t = doc.get_i64("t").unwrap_or(0);
+    let d_val = doc.get_str("d").unwrap_or("").to_string();
+    let p_val = doc.get_str("P").unwrap_or("").to_string();
 
     let url = format!(
         "{}/{}",
         state.config.r2_public_domain,
-        urlencoding::encode(doc.get_str("f").unwrap_or(""))
+        urlencoding::encode(&f)
     );
 
-    let _: Result<(), _> = state
-        .redis
-        .set(
-            &cache_key,
-            &url,
-            Some(Expiration::EX(86400)),
-            None,
-            false,
-        )
-        .await;
+    let d = if d_val.is_empty() { None } else { Some(d_val) };
+    let p = if p_val.is_empty() { None } else { Some(p_val) };
 
-    Ok(HttpResponse::Ok().json(ImageResponse {
+    let response = ImageResponse {
         ok: 1,
+        id: id.clone(),
         url,
+        f,
+        s,
+        t,
+        d,
+        p,
         c: None,
-    }))
+    };
+
+    // Cache full response JSON (24h)
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _: Result<(), _> = state
+            .redis
+            .set(
+                &cache_key,
+                &json,
+                Some(Expiration::EX(86400)),
+                None,
+                false,
+            )
+            .await;
+    }
+
+    Ok(HttpResponse::Ok().json(response))
 }
 
 // GET /health
